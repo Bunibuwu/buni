@@ -274,7 +274,7 @@ const coverIn=(p,l='l')=>p.cover?`<img src="/f/${p.cover}" alt="" loading="lazy"
 const plBadges=p=>(p.platforms?p.platforms.split(','):[]).map(x=>`<span class="pill">${PLN[x]||x}</span>`).join(' ');
 const pcolor=p=>COLORS[p.id%6];
 V.store=async a=>{if(a[0]=='cart')return cartView();if(a[0])return productView(a[0]);const n=(await api('/cart')).length;S.after=()=>loadStore();
- return`<div class="pg"><div class="tool"><div class="s">${ic('search')}<input id="sq" placeholder="Search games and apps" value="${esc(S.st.q)}" data-input="loadStore"></div>
+ return`<div class="pg"><div class="tool"><div class="s">${ic('search')}<input id="sq" placeholder="Search games and apps test" value="${esc(S.st.q)}" data-input="loadStore"></div>
  <select id="ss" style="width:auto" data-change="loadStore">${[['new','Newest'],['name','A–Z']].map(o=>`<option value="${o[0]}" ${S.st.sort==o[0]?'selected':''}>${o[1]}</option>`).join('')}</select>
  <button class="ib" data-act="nav" data-h="store/cart" style="position:relative" title="Cart">${ic('cart')}${n?`<span class="bd" style="position:absolute;top:-4px;right:-4px">${n}</span>`:''}</button>${S.me.admin?`<button class="btn" data-act="prodEdit" data-id="">${ic('plus','s')} Add item</button>`:''}</div>
  <div class="chips" style="margin-bottom:14px">${[['all','All'],['game','Games'],['app','Apps']].map(c=>`<button class="chip ${S.st.kind==c[0]?'on':''}" data-act="storeKind" data-k="${c[0]}">${c[1]}</button>`).join('')}</div><div class="grid" id="sg"></div></div>`};
