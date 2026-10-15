@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS tokens(tok PRIMARY KEY,uid,ts);
 CREATE TABLE IF NOT EXISTS notifs(id INTEGER PRIMARY KEY,uid,text,link,ts,read DEFAULT 0);
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,kind,name,descr,tag,cover,version,ts);
 CREATE TABLE IF NOT EXISTS achievements(id INTEGER PRIMARY KEY,pid,name,descr,ts);
+CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY,reporter,kind,target,tuser,reason,details,snap,conv,server,status DEFAULT 'open',note,handler,ts,hts);
+CREATE TABLE IF NOT EXISTS user_ips(uid,ip,first,last,PRIMARY KEY(uid,ip));
+CREATE TABLE IF NOT EXISTS ip_bans(ip PRIMARY KEY,reason,by,ts);
+CREATE TABLE IF NOT EXISTS dev_requests(id INTEGER PRIMARY KEY,uid,message,status DEFAULT 'pending',note,handler,ts,hts);
+CREATE TABLE IF NOT EXISTS downloads(id INTEGER PRIMARY KEY,pid,label,fn,name,size,ts);
 CREATE TABLE IF NOT EXISTS pfiles(pid,platform,fn,name,size,PRIMARY KEY(pid,platform));
 CREATE TABLE IF NOT EXISTS cart(uid,pid,PRIMARY KEY(uid,pid));
 CREATE TABLE IF NOT EXISTS owned(uid,pid,ts,minutes DEFAULT 0,PRIMARY KEY(uid,pid));
@@ -144,11 +149,11 @@ CREATE TABLE IF NOT EXISTS roles(id INTEGER PRIMARY KEY,server,name,perms,color,
 CREATE TABLE IF NOT EXISTS mroles(server,uid,role,PRIMARY KEY(server,uid,role));
 CREATE TABLE IF NOT EXISTS bans(server,uid,PRIMARY KEY(server,uid));
 CREATE TABLE IF NOT EXISTS chroles(conv,role,can_view DEFAULT 0,can_send DEFAULT 0,PRIMARY KEY(conv,role));
-CREATE INDEX IF NOT EXISTS i_msgs ON msgs(conv,id);CREATE INDEX IF NOT EXISTS i_com ON comments(kind,tid);CREATE INDEX IF NOT EXISTS i_votes ON votes(kind,tid);
+CREATE INDEX IF NOT EXISTS i_rep ON reports(status,kind,ts);CREATE INDEX IF NOT EXISTS i_dls ON downloads(pid);CREATE INDEX IF NOT EXISTS i_msgs ON msgs(conv,id);CREATE INDEX IF NOT EXISTS i_com ON comments(kind,tid);CREATE INDEX IF NOT EXISTS i_votes ON votes(kind,tid);
 CREATE INDEX IF NOT EXISTS i_tw ON tweets(uid);CREATE INDEX IF NOT EXISTS i_posts ON posts(board);CREATE INDEX IF NOT EXISTS i_cont ON content(uid,kind);CREATE INDEX IF NOT EXISTS i_not ON notifs(uid);
 CREATE INDEX IF NOT EXISTS i_cm ON cmembers(uid);CREATE INDEX IF NOT EXISTS i_fol ON follows(b);CREATE INDEX IF NOT EXISTS i_tok ON tokens(uid);CREATE INDEX IF NOT EXISTS i_conv ON convs(server);CREATE INDEX IF NOT EXISTS i_sm ON smembers(uid);
 """
-MIGRATE = [('users', 'avatar'), ('users', 'banner'), ('users', 'admin INTEGER DEFAULT 0'), ('users', 'banned INTEGER DEFAULT 0'), ('users', 'ban_reason'), ('users', 'created'), ('comments', 'parent'), ('posts', 'tags DEFAULT ""'), ('posts', 'edited DEFAULT 0'),
+MIGRATE = [('users', 'dev INTEGER DEFAULT 0'), ('products', 'owner'), ('msgs', 'reply'), ('users', 'avatar'), ('users', 'banner'), ('users', 'admin INTEGER DEFAULT 0'), ('users', 'banned INTEGER DEFAULT 0'), ('users', 'ban_reason'), ('users', 'created'), ('comments', 'parent'), ('posts', 'tags DEFAULT ""'), ('posts', 'edited DEFAULT 0'),
            ('tweets', 'edited DEFAULT 0'), ('boards', 'tags DEFAULT ""'), ('convs', 'private INTEGER DEFAULT 0'), ('convs', 'readonly INTEGER DEFAULT 0'), ('content', 'embed'), ('content', 'thumb'), ('msgs', 'edited DEFAULT 0')]
 class E(Exception):
     def __init__(s, m, c=400): super().__init__(m); s.c = c
@@ -204,12 +209,21 @@ def route(p, m='GET', a=True, admin=False):
                     g.u, g.admin = c[0], bool(c[1])
                     if admin and not g.admin: raise E('Admins only', 403)
                     if now() - SEEN.get(g.u, 0) > 20: SEEN[g.u] = now(); X('UPDATE users SET seen=? WHERE id=?', now(), g.u)
+                    track_ip(g.u)
                 return jsonify(f(**k))
             except E as e:
                 db().rollback(); return jsonify(error=str(e)), e.c
         w.__name__ = f.__name__ + str(len(app.url_map._rules))
         app.route('/api' + p, methods=[m])(w); return f
     return d
+BANNED_IPS, IPSEEN = set(), {}
+def track_ip(uid):
+    ip = request.remote_addr or ''
+    if ip and now() - IPSEEN.get((uid, ip), 0) > 600:
+        IPSEEN[(uid, ip)] = now(); X('INSERT INTO user_ips VALUES(?,?,?,?) ON CONFLICT(uid,ip) DO UPDATE SET last=?', uid, ip, now(), now(), now())
+@app.before_request
+def ip_gate():
+    if BANNED_IPS and request.remote_addr in BANNED_IPS: return jsonify(error='This IP address has been banned from this server'), 403
 def limit(kind):
     n = request.content_length or 0
     if n > LIM[kind] + 2 * MB: raise E(f'File too large (max {LIM[kind] // MB} MB)', 413)
@@ -231,7 +245,7 @@ def mk_user(n, p):
     s = secrets.token_hex(16); first = 0 if Q1('SELECT 1 FROM users') else 1
     return X('INSERT INTO users(name,salt,pw,display,color,seen,settings,admin,created) VALUES(?,?,?,?,?,?,?,?,?)', n, s, hp(p, s), n, COLORS[len(n) % 6], 0, '{}', first, now())
 def tok(uid):
-    t = secrets.token_urlsafe(32); X('INSERT INTO tokens VALUES(?,?,?)', t, uid, now()); return dict(token=t)
+    t = secrets.token_urlsafe(32); X('INSERT INTO tokens VALUES(?,?,?)', t, uid, now()); track_ip(uid); return dict(token=t)
 def throttle(key, add=False):
     n, t = FAIL.get(key, (0, 0))
     if now() - t > 60: n = 0
@@ -255,12 +269,16 @@ def login():
 @route('/logout', 'POST')
 def logout(): X('DELETE FROM tokens WHERE tok=?', request.headers.get('X-Token')); TOK.pop(request.headers.get('X-Token'), None); return {}
 def pub(u): return dict(id=u['id'], name=u['name'], display=u['display'], color=u['color'], bio=u['bio'], avatar=u['avatar'], banner=u['banner'])
-@route('/me')
-def me():
+def me_base():
     u = Q1('SELECT * FROM users WHERE id=?', g.u)
-    return dict(pub(u), admin=bool(u['admin']), settings=json.loads(u['settings'] or '{}'), unread=Q1('SELECT COUNT(*) n FROM notifs WHERE uid=? AND read=0', g.u)['n'],
+    return dict(pub(u), admin=bool(u['admin']), dev=bool(u['dev']), settings=json.loads(u['settings'] or '{}'), unread=Q1('SELECT COUNT(*) n FROM notifs WHERE uid=? AND read=0', g.u)['n'],
                 unread_dm=Q1('SELECT COUNT(*) n FROM msgs m JOIN cmembers c ON c.conv=m.conv AND c.uid=? WHERE m.uid!=? AND m.id>COALESCE((SELECT last FROM reads WHERE conv=m.conv AND uid=?),0)', g.u, g.u, g.u)['n'],
                 muted=[r['name'] for r in Q('SELECT u.name FROM mutes m JOIN users u ON u.id=m.b WHERE m.a=?', g.u)])
+@route('/me')
+def me():
+    d = me_base()
+    if d['admin']: d.update(open_reports=Q1("SELECT COUNT(*) n FROM reports WHERE status='open'")['n'], dev_pending=Q1("SELECT COUNT(*) n FROM dev_requests WHERE status='pending'")['n'])
+    return d
 @route('/me', 'PUT')
 def me_put():
     b = B()
@@ -323,16 +341,20 @@ def profile(name):
     d = dict(pub(u), followers=Q1('SELECT COUNT(*) n FROM follows WHERE b=?', u['id'])['n'], following=Q1('SELECT COUNT(*) n FROM follows WHERE a=?', u['id'])['n'],
              is_following=bool(Q1('SELECT 1 FROM follows WHERE a=? AND b=?', g.u, u['id'])), rel=rel(g.u, u['id']), tweets=tweet_rows('WHERE t.uid=?', u['id']), online=online(u),
              muted=bool(Q1('SELECT 1 FROM mutes WHERE a=? AND b=?', g.u, u['id'])), uploads=Q1('SELECT COUNT(*) n FROM content WHERE uid=?', u['id'])['n'])
-    if g.admin: d.update(site_admin=bool(u['admin']), banned=bool(u['banned']))
+    if g.admin: d.update(site_admin=bool(u['admin']), banned=bool(u['banned']), dev=bool(u['dev']))
     return d
 @route('/users')
 def users():
     q = re.sub(r'[%_]', '', cl(request.args.get('q'), 20)); return [pub(u) for u in Q('SELECT * FROM users WHERE name LIKE ? AND id!=? AND banned=0 ORDER BY name LIMIT 20', q + '%', g.u)]
 
 # ---------------- store / cart / library (everything is free for now) ----------------
+def attach_dls(L):
+    D = {}
+    for d in Q(f'SELECT id,pid,label,name,size FROM downloads WHERE pid IN ({IN(p["id"] for p in L)}) ORDER BY id'): D.setdefault(d['pid'], []).append(d)
+    for p in L: p['dls'] = D.get(p['id'], []); p['platforms'] = ','.join(d['label'] for d in p['dls'])
+    return L
 def prod_rows(where='', *a):
-    return Q(f'''SELECT p.*,EXISTS(SELECT 1 FROM owned o WHERE o.pid=p.id AND o.uid=?) owned,EXISTS(SELECT 1 FROM cart c WHERE c.pid=p.id AND c.uid=?) incart,
-      (SELECT group_concat(platform) FROM pfiles WHERE pid=p.id) platforms FROM products p {where}''', g.u, g.u, *a)
+    return attach_dls(Q(f'''SELECT p.*,(SELECT name FROM users WHERE id=p.owner) dev,EXISTS(SELECT 1 FROM owned o WHERE o.pid=p.id AND o.uid=?) owned,EXISTS(SELECT 1 FROM cart c WHERE c.pid=p.id AND c.uid=?) incart FROM products p {where}''', g.u, g.u, *a))
 @route('/store')
 def store():
     k, q, s = request.args.get('kind', 'all'), cl(request.args.get('q'), 40).lower(), request.args.get('sort', 'new')
@@ -362,7 +384,7 @@ def checkout():
     notify(g.u, f'{len(items)} item(s) added to your library (order {oid})', '#/library'); return dict(order=oid, count=len(items))
 @route('/library')
 def library():
-    L = Q('''SELECT p.*,o.minutes,o.ts bought,(SELECT group_concat(platform) FROM pfiles WHERE pid=p.id) platforms FROM owned o JOIN products p ON p.id=o.pid WHERE o.uid=? ORDER BY o.minutes DESC,o.ts DESC''', g.u)
+    L = attach_dls(Q('''SELECT p.*,(SELECT name FROM users WHERE id=p.owner) dev,o.minutes,o.ts bought FROM owned o JOIN products p ON p.id=o.pid WHERE o.uid=? ORDER BY o.minutes DESC,o.ts DESC''', g.u))
     A = {}
     for a in Q(f'SELECT id,pid,name,descr FROM achievements WHERE pid IN ({IN(p["id"] for p in L)}) ORDER BY id'): A.setdefault(a['pid'], []).append(dict(id=a['id'], name=a['name'], descr=a['descr'], done=False))
     for p in L: p['ach'] = A.get(p['id'], [])
@@ -372,14 +394,16 @@ def play(pid):
     o = Q1('SELECT minutes FROM owned WHERE uid=? AND pid=?', g.u, pid)
     if not o: raise E('Not in your library', 403)
     X('UPDATE owned SET minutes=minutes+1 WHERE uid=? AND pid=?', g.u, pid); return dict(minutes=o['minutes'] + 1)
-@app.get('/api/library/<int:pid>/download/<plat>')
-def download(pid, plat):
+@route('/library/<int:pid>/remove', 'POST')
+def lib_remove(pid): X('DELETE FROM owned WHERE uid=? AND pid=?', g.u, pid); return {}
+@app.get('/api/library/<int:pid>/download/<int:did>')
+def download(pid, did):
     c = authed(); tk = request.args.get('t')
-    if not c and tk: TOK.pop(tk, None); r = Q1('SELECT uid FROM tokens WHERE tok=?', tk); c = (r['uid'], 0, 0, 0) if r else None
+    if not c and tk: r = Q1('SELECT uid FROM tokens WHERE tok=?', tk); c = (r['uid'], 0, 0, 0) if r else None
     if not c: abort(401)
-    adm = Q1('SELECT admin FROM users WHERE id=?', c[0])['admin']
-    if not adm and not Q1('SELECT 1 FROM owned WHERE uid=? AND pid=?', c[0], pid): abort(403)
-    f = Q1('SELECT * FROM pfiles WHERE pid=? AND platform=?', pid, plat)
+    adm = Q1('SELECT admin FROM users WHERE id=?', c[0])['admin']; p = Q1('SELECT owner FROM products WHERE id=?', pid)
+    if not adm and not (p and p['owner'] == c[0]) and not Q1('SELECT 1 FROM owned WHERE uid=? AND pid=?', c[0], pid): abort(403)
+    f = Q1('SELECT * FROM downloads WHERE id=? AND pid=?', did, pid)
     if not f: abort(404)
     return send_file(os.path.join(PF, f['fn']), as_attachment=True, download_name=f['name'], conditional=True)
 
@@ -736,7 +760,7 @@ def conv_get(cid):
 def sperms(sid, uid):
     s = Q1('SELECT owner FROM servers WHERE id=?', sid)
     if not s or not Q1('SELECT 1 FROM smembers WHERE server=? AND uid=?', sid, uid): return set()
-    if s['owner'] == uid: return set(PERMS)
+    if s['owner'] == uid or (uid == g.get('u') and g.get('admin')): return set(PERMS)
     ps = set()
     for r in Q('SELECT perms FROM roles WHERE server=? AND (base=1 OR id IN (SELECT role FROM mroles WHERE server=? AND uid=?))', sid, sid, uid): ps |= set(filter(None, r['perms'].split(',')))
     return set(PERMS) if 'admin' in ps else ps
@@ -809,7 +833,7 @@ def group_leave(cid): X('DELETE FROM cmembers WHERE conv=? AND uid=?', cid, g.u)
 @route('/convs/<int:cid>/msgs')
 def msgs_get(cid):
     c = conv_get(cid); access(c)
-    L = Q('SELECT m.id,m.body,m.ts,m.edited,u.id uid,u.name author,u.display,u.color,u.avatar FROM msgs m JOIN users u ON u.id=m.uid WHERE conv=? ORDER BY m.id DESC LIMIT 100', cid)[::-1]
+    L = Q('SELECT m.id,m.body,m.ts,m.edited,m.reply,u.id uid,u.name author,u.display,u.color,u.avatar,rm.body rbody,ru.name rauthor,ru.display rdisplay FROM msgs m JOIN users u ON u.id=m.uid LEFT JOIN msgs rm ON rm.id=m.reply LEFT JOIN users ru ON ru.id=rm.uid WHERE m.conv=? ORDER BY m.id DESC LIMIT 100', cid)[::-1]
     if L: X('INSERT OR REPLACE INTO reads VALUES(?,?,?)', cid, g.u, L[-1]['id'])
     mod = c['kind'] in ('text', 'voice') and 'messages' in sperms(c['server'], g.u)
     for m in L: m['can'] = m['uid'] == g.u or mod or g.admin
@@ -822,7 +846,9 @@ def msgs_post(cid):
         o = Q1('SELECT uid FROM cmembers WHERE conv=? AND uid!=?', cid, g.u)
         if o and rel(g.u, o['uid']) in ('blocked', 'blockedby'): raise E('You cannot message this user', 403)
         o and notify(o['uid'], f'{me_name()}: {t[:60]}', f'#/social/dm/{cid}', 'dm')
-    i = X('INSERT INTO msgs(conv,uid,body,ts) VALUES(?,?,?,?)', cid, g.u, t, now())
+    rp = B().get('reply'); ro = Q1('SELECT uid FROM msgs WHERE id=? AND conv=?', rp, cid) if rp else None
+    i = X('INSERT INTO msgs(conv,uid,body,ts,reply) VALUES(?,?,?,?,?)', cid, g.u, t, now(), rp if ro else None)
+    if ro and ro['uid'] != g.u and c['kind'] != 'dm': notify(ro['uid'], f'{me_name()} replied to your message: {t[:50]}', f'#/social/dm/{cid}' if c['kind'] == 'group' else f"#/social/s/{c['server']}/{cid}", 'reply')
     mentions(t, f'#/social/dm/{cid}' if c['kind'] in ('dm', 'group') else f"#/social/s/{c['server']}/{cid}"); return dict(id=i)
 @route('/msgs/<int:i>', 'DELETE')
 def msg_del(i):
@@ -1038,10 +1064,12 @@ def purge_user(uid):
         X(f'DELETE FROM {t} WHERE ' + ' OR '.join(f'{c}=?' for c in cols), *([uid] * len(cols)))
     drop_user_files(u); X('DELETE FROM users WHERE id=?', uid); forget(uid)
 @route('/admin/stats', admin=True)
-def adm_stats(): return {k: Q1(f'SELECT COUNT(*) n FROM {t}')['n'] for k, t in dict(users='users', videos='content', posts='posts', tweets='tweets', boards='boards', servers='servers', products='products').items()}
+def adm_stats():
+    d = {k: Q1(f'SELECT COUNT(*) n FROM {t}')['n'] for k, t in dict(users='users', videos='content', posts='posts', tweets='tweets', boards='boards', servers='servers', products='products').items()}
+    d['open_reports'] = Q1("SELECT COUNT(*) n FROM reports WHERE status='open'")['n']; return d
 @route('/admin/users', admin=True)
 def adm_users():
-    q = re.sub(r'[%_]', '', cl(request.args.get('q'), 20)); return Q('SELECT id,name,display,admin,banned,ban_reason,created,seen FROM users WHERE name LIKE ? ORDER BY created DESC LIMIT 100', '%' + q + '%')
+    q = re.sub(r'[%_]', '', cl(request.args.get('q'), 20)); return Q('SELECT id,name,display,admin,dev,banned,ban_reason,created,seen FROM users WHERE name LIKE ? ORDER BY created DESC LIMIT 100', '%' + q + '%')
 @route('/admin/ban', 'POST', admin=True)
 def adm_ban():
     b = B(); u = Q1('SELECT * FROM users WHERE id=?', b.get('uid'))
@@ -1095,42 +1123,197 @@ def prod_fields(b):
     n = cl(b.get('name'), 80)
     if not n: raise E('Name required')
     return n, 'app' if b.get('kind') == 'app' else 'game', cl(b.get('tag'), 40), cl(b.get('descr'), 2000), cl(b.get('version'), 20)
-@route('/admin/products', 'POST', admin=True)
-def adm_prod_new(): n, k, t, d, v = prod_fields(B()); return dict(id=X('INSERT INTO products(kind,name,descr,tag,version,ts) VALUES(?,?,?,?,?,?)', k, n, d, t, v, now()))
-@route('/admin/products/<int:i>', 'PUT', admin=True)
-def adm_prod_edit(i): n, k, t, d, v = prod_fields(B()); X('UPDATE products SET kind=?,name=?,descr=?,tag=?,version=? WHERE id=?', k, n, d, t, v, i); return {}
-@route('/admin/products/<int:i>', 'DELETE', admin=True)
-def adm_prod_del(i):
-    for f in Q('SELECT fn FROM pfiles WHERE pid=?', i): rmfile(f['fn'], PF)
+def can_prod(pid=None):
+    if g.admin: return True
+    if not Q1('SELECT dev FROM users WHERE id=?', g.u)['dev']: return False
+    if pid is None: return True
+    p = Q1('SELECT owner FROM products WHERE id=?', pid); return bool(p and p['owner'] == g.u)
+def need_prod(pid=None):
+    if not can_prod(pid): raise E('Developer access is needed to publish games' if pid is None else 'You can only edit your own games', 403)
+@route('/dev/products')
+def dev_products():
+    L = prod_rows('WHERE 1=1' if g.admin else 'WHERE p.owner=%d' % g.u)
+    for p in L: p['owners'] = Q1('SELECT COUNT(*) n FROM owned WHERE pid=?', p['id'])['n']
+    return L
+@route('/admin/products', 'POST')
+def prod_new(): need_prod(); n, k, t, d, v = prod_fields(B()); return dict(id=X('INSERT INTO products(kind,name,descr,tag,version,ts,owner) VALUES(?,?,?,?,?,?,?)', k, n, d, t, v, now(), g.u))
+@route('/admin/products/<int:i>', 'PUT')
+def prod_edit(i): need_prod(i); n, k, t, d, v = prod_fields(B()); X('UPDATE products SET kind=?,name=?,descr=?,tag=?,version=? WHERE id=?', k, n, d, t, v, i); return {}
+@route('/admin/products/<int:i>', 'DELETE')
+def prod_del(i):
+    need_prod(i)
+    for f in Q('SELECT fn FROM downloads WHERE pid=?', i): rmfile(f['fn'], PF)
     p = Q1('SELECT cover FROM products WHERE id=?', i); p and rmfile(p['cover'])
-    for t in ('pfiles', 'cart', 'owned', 'achievements'): X(f'DELETE FROM {t} WHERE pid=?', i)
+    for t in ('downloads', 'cart', 'owned', 'achievements'): X(f'DELETE FROM {t} WHERE pid=?', i)
     X('DELETE FROM products WHERE id=?', i); return {}
-@route('/admin/products/<int:i>/cover', 'POST', admin=True)
-def adm_cover(i):
-    limit('image'); f = request.files.get('file'); p = Q1('SELECT cover FROM products WHERE id=?', i)
+@route('/admin/products/<int:i>/cover', 'POST')
+def prod_cover(i):
+    limit('image'); need_prod(i); f = request.files.get('file'); p = Q1('SELECT cover FROM products WHERE id=?', i)
     if not p: raise E('Not found', 404)
     rmfile(p['cover'])
     X('UPDATE products SET cover=? WHERE id=?', save_upload(f, 'image', exts=('.png', '.jpg', '.jpeg', '.webp', '.gif'))[0] if f and f.filename else None, i); return {}
-@route('/admin/products/<int:i>/file', 'POST', admin=True)
-def adm_pfile(i):
-    limit('product'); plat, f = request.form.get('platform'), request.files.get('file')
-    if plat not in PLATFORMS or not f or not f.filename: raise E('Pick a platform and a file')
-    if not Q1('SELECT 1 FROM products WHERE id=?', i): raise E('Not found', 404)
-    old = Q1('SELECT fn FROM pfiles WHERE pid=? AND platform=?', i, plat); old and rmfile(old['fn'], PF)
-    fn, size = save_upload(f, 'product', PF); X('INSERT OR REPLACE INTO pfiles VALUES(?,?,?,?,?)', i, plat, fn, re.sub(r'[^\w.\- ]', '_', f.filename)[:100], size); return {}
-@route('/admin/products/<int:i>/file/<plat>', 'DELETE', admin=True)
-def adm_pfile_del(i, plat):
-    old = Q1('SELECT fn FROM pfiles WHERE pid=? AND platform=?', i, plat); old and rmfile(old['fn'], PF); X('DELETE FROM pfiles WHERE pid=? AND platform=?', i, plat); return {}
-@route('/admin/products/<int:i>/achievements', 'POST', admin=True)
+@route('/admin/products/<int:i>/downloads', 'POST')
+def dl_add(i):
+    need_prod(i); limit('product'); label, f = cl(request.form.get('label'), 40), request.files.get('file')
+    if not label or not f or not f.filename: raise E('Give the download a label (for example "Beta" or "Windows") and choose a file')
+    if Q1('SELECT COUNT(*) n FROM downloads WHERE pid=?', i)['n'] >= 12: raise E('Up to 12 downloads per game')
+    fn, size = save_upload(f, 'product', PF); return dict(id=X('INSERT INTO downloads(pid,label,fn,name,size,ts) VALUES(?,?,?,?,?,?)', i, label, fn, re.sub(r'[^\w.\- ]', '_', f.filename)[:100], size, now()))
+@route('/admin/downloads/<int:d>', 'PUT')
+def dl_rename(d):
+    r = Q1('SELECT pid FROM downloads WHERE id=?', d)
+    if not r: raise E('Not found', 404)
+    need_prod(r['pid']); l = cl(B().get('label'), 40)
+    if not l: raise E('Label required')
+    X('UPDATE downloads SET label=? WHERE id=?', l, d); return {}
+@route('/admin/downloads/<int:d>', 'DELETE')
+def dl_del(d):
+    r = Q1('SELECT * FROM downloads WHERE id=?', d)
+    if not r: raise E('Not found', 404)
+    need_prod(r['pid']); rmfile(r['fn'], PF); X('DELETE FROM downloads WHERE id=?', d); return {}
+@route('/admin/products/<int:i>/achievements', 'POST')
 def adm_ach_add(i):
-    b = B(); n = cl(b.get('name'), 60)
+    need_prod(i); b = B(); n = cl(b.get('name'), 60)
     if not n: raise E('Give the achievement a name')
-    if not Q1('SELECT 1 FROM products WHERE id=?', i): raise E('Not found', 404)
     return dict(id=X('INSERT INTO achievements(pid,name,descr,ts) VALUES(?,?,?,?)', i, n, cl(b.get('descr'), 200), now()))
-@route('/admin/achievements/<int:i>', 'DELETE', admin=True)
-def adm_ach_del(i): X('DELETE FROM achievements WHERE id=?', i); return {}
-@route('/admin/products/<int:i>/files', admin=True)
-def adm_pfiles(i): return Q('SELECT platform,name,size FROM pfiles WHERE pid=?', i)
+@route('/admin/achievements/<int:i>', 'DELETE')
+def adm_ach_del(i):
+    a = Q1('SELECT pid FROM achievements WHERE id=?', i)
+    if a: need_prod(a['pid']); X('DELETE FROM achievements WHERE id=?', i)
+    return {}
+
+# ---------------- developer access ----------------
+@route('/dev/status')
+def dev_status(): return dict(dev=bool(Q1('SELECT dev FROM users WHERE id=?', g.u)['dev']), request=Q1('SELECT status,message,note,ts FROM dev_requests WHERE uid=? ORDER BY id DESC LIMIT 1', g.u))
+@route('/dev/request', 'POST')
+def dev_request():
+    m = cl(B().get('message'), 600)
+    if Q1('SELECT dev FROM users WHERE id=?', g.u)['dev']: raise E('You already have developer access')
+    if Q1("SELECT 1 FROM dev_requests WHERE uid=? AND status='pending'", g.u): raise E('Your request is already waiting for review')
+    if len(m) < 10: raise E('Tell us a little about what you want to publish (10+ characters)')
+    X('INSERT INTO dev_requests(uid,message,ts) VALUES(?,?,?)', g.u, m, now()); return {}
+@route('/admin/dev_requests', admin=True)
+def adm_dev_requests():
+    st = request.args.get('status', 'pending')
+    return Q('SELECT r.*,u.name,u.display,u.avatar FROM dev_requests r JOIN users u ON u.id=r.uid WHERE (?1="all" OR r.status=?1) ORDER BY r.id DESC LIMIT 100', st)
+@route('/admin/dev_requests/<int:i>', 'POST', admin=True)
+def adm_dev_decide(i):
+    r = Q1('SELECT * FROM dev_requests WHERE id=?', i); b = B()
+    if not r: raise E('Not found', 404)
+    ok = bool(b.get('approve')); X('UPDATE dev_requests SET status=?,note=?,handler=?,hts=? WHERE id=?', 'approved' if ok else 'denied', cl(b.get('note'), 300), g.u, now(), i)
+    if ok: X('UPDATE users SET dev=1 WHERE id=?', r['uid'])
+    notify(r['uid'], 'Your developer request was approved. You can now publish and edit your own games.' if ok else 'Your developer request was not approved.' + (' ' + cl(b.get('note'), 300) if b.get('note') else ''), '#/developer' if ok else '#/settings'); return {}
+@route('/admin/users/<int:uid>/dev', 'POST', admin=True)
+def adm_user_dev(uid): X('UPDATE users SET dev=? WHERE id=?', 1 if B().get('on', True) else 0, uid); return {}
+
+# ---------------- reports (site admin review queue) ----------------
+REPORT_KINDS = ('user', 'video', 'short', 'live', 'server', 'message', 'post', 'tweet', 'comment', 'board')
+def snapshot(k, t):
+    """Evidence captured at report time: (snapshot dict, reported user id, conversation id, server id)."""
+    def nf(): raise E('That no longer exists', 404)
+    if k == 'user':
+        u = Q1('SELECT * FROM users WHERE id=? OR name=?', t, t) or nf(); return dict(title='@' + u['name'], text=u['bio'] or '', link='#/u/' + u['name']), u['id'], None, None
+    if k in ('video', 'short', 'live'):
+        c = Q1('SELECT c.*,u.name author FROM content c JOIN users u ON u.id=c.uid WHERE c.id=?', t) or nf()
+        return dict(title=c['title'], text=c['descr'] or '', author=c['author'], link={'video': '#/content/watch/', 'short': '#/content/short/', 'live': '#/content/live/'}[k] + str(c['id'])), c['uid'], None, None
+    if k == 'server':
+        sv = Q1('SELECT * FROM servers WHERE id=?', t) or nf(); n = Q1('SELECT COUNT(*) n FROM smembers WHERE server=?', sv['id'])['n']
+        return dict(title=sv['name'], text=f'{n} members', author=(Q1('SELECT name FROM users WHERE id=?', sv['owner']) or {}).get('name', '')), sv['owner'], None, sv['id']
+    if k == 'message':
+        m = Q1('SELECT m.*,u.name author FROM msgs m JOIN users u ON u.id=m.uid WHERE m.id=?', t) or nf(); c = conv_get(m['conv']); access(c)
+        ctx = Q('SELECT m.id,m.body,m.ts,u.name author FROM msgs m JOIN users u ON u.id=m.uid WHERE m.conv=? AND m.id<=? ORDER BY m.id DESC LIMIT 8', c['id'], m['id'])[::-1] + Q('SELECT m.id,m.body,m.ts,u.name author FROM msgs m JOIN users u ON u.id=m.uid WHERE m.conv=? AND m.id>? ORDER BY m.id LIMIT 4', c['id'], m['id'])
+        where = (Q1('SELECT name FROM servers WHERE id=?', c['server']) or {}).get('name', '') + ' #' + (c['name'] or '') if c['server'] else ('Group chat: ' + (c['name'] or '') if c['kind'] == 'group' else 'Direct message')
+        return dict(title='Message by @' + m['author'], text=m['body'], author=m['author'], where=where, context=ctx, msg=m['id']), m['uid'], c['id'], c['server']
+    if k == 'post':
+        p = Q1('SELECT p.*,u.name author FROM posts p JOIN users u ON u.id=p.uid WHERE p.id=?', t) or nf(); return dict(title=p['title'], text=p['body'], author=p['author'], link=f"#/community/post/{p['id']}"), p['uid'], None, None
+    if k == 'tweet':
+        w = Q1('SELECT t.*,u.name author FROM tweets t JOIN users u ON u.id=t.uid WHERE t.id=?', t) or nf(); return dict(title='Post by @' + w['author'], text=w['body'], author=w['author'], link=f"#/community/tweet/{w['id']}"), w['uid'], None, None
+    if k == 'comment':
+        c = Q1('SELECT c.*,u.name author FROM comments c JOIN users u ON u.id=c.uid WHERE c.id=?', t) or nf()
+        link = {'content': '#/content/watch/', 'live': '#/content/live/', 'tweet': '#/community/tweet/', 'post': '#/community/post/'}.get(c['kind'], '#/') + str(c['tid']); return dict(title='Comment by @' + c['author'], text=c['body'], author=c['author'], link=link), c['uid'], None, None
+    if k == 'board':
+        b = Q1('SELECT b.*,u.name author FROM boards b JOIN users u ON u.id=b.owner WHERE b.name=?', t.lower()) or nf(); return dict(title='b/' + b['name'], text=b['descr'] or '', author=b['author'], link='#/community/b/' + b['name']), b['owner'], None, None
+@route('/reports', 'POST')
+def report_new():
+    b = B(); k, t, reason = b.get('kind'), str(b.get('id', '')), cl(b.get('reason'), 40)
+    if k not in REPORT_KINDS or not t or not reason: raise E('Choose what is wrong with it')
+    if Q1('SELECT COUNT(*) n FROM reports WHERE reporter=? AND ts>?', g.u, now() - 3600)['n'] >= 12: raise E('You have sent a lot of reports this hour. Please wait a bit.', 429)
+    snap, tuser, conv, server = snapshot(k, t)
+    if tuser == g.u: raise E('You cannot report your own content')
+    if Q1("SELECT 1 FROM reports WHERE reporter=? AND kind=? AND target=? AND status='open'", g.u, k, t): raise E('You already reported this. A site admin will review it.')
+    X('INSERT INTO reports(reporter,kind,target,tuser,reason,details,snap,conv,server,ts) VALUES(?,?,?,?,?,?,?,?,?,?)', g.u, k, t, tuser, reason, cl(b.get('details'), 1000), json.dumps(snap), conv, server, now()); return {}
+@route('/admin/reports', admin=True)
+def adm_reports():
+    a = request.args; w, p = ['1=1'], []
+    if a.get('status', 'open') != 'all': w.append('r.status=?'); p.append(a.get('status', 'open'))
+    if a.get('kind'): w.append('r.kind=?'); p.append(a['kind'])
+    if a.get('reporter'): w.append('ru.name LIKE ?'); p.append('%' + cl(a['reporter'], 20) + '%')
+    if a.get('user'): w.append('tu.name LIKE ?'); p.append('%' + cl(a['user'], 20) + '%')
+    if a.get('reason'): w.append('r.reason=?'); p.append(a['reason'])
+    if a.get('q'): q = '%' + cl(a['q'], 60) + '%'; w.append('(r.snap LIKE ? OR r.details LIKE ?)'); p += [q, q]
+    try:
+        if a.get('from'): w.append('r.ts>=?'); p.append(float(a['from']))
+        if a.get('to'): w.append('r.ts<=?'); p.append(float(a['to']))
+    except ValueError: raise E('Bad date')
+    order = {'old': 'r.ts ASC', 'count': 'n DESC, r.ts DESC'}.get(a.get('sort'), 'r.ts DESC')
+    rows = Q(f"""SELECT r.id,r.kind,r.target,r.reason,r.details,r.snap,r.status,r.note,r.ts,r.hts,r.conv,r.server,ru.name reporter,tu.name tuser,r.tuser tuid,
+      (SELECT COUNT(*) FROM reports x WHERE x.kind=r.kind AND x.target=r.target) n,(SELECT COUNT(*) FROM reports x WHERE r.tuser IS NOT NULL AND x.tuser=r.tuser) nuser
+      FROM reports r LEFT JOIN users ru ON ru.id=r.reporter LEFT JOIN users tu ON tu.id=r.tuser WHERE {' AND '.join(w)} ORDER BY {order} LIMIT 200 OFFSET ?""", *p, int(a.get('offset', 0) or 0))
+    for r in rows: r['snap'] = json.loads(r['snap'] or '{}'); r['snap'].pop('context', None)
+    return dict(rows=rows, counts={s: Q1('SELECT COUNT(*) n FROM reports WHERE status=?', s)['n'] for s in ('open', 'resolved', 'dismissed')})
+@route('/admin/reports/<int:i>', admin=True)
+def adm_report(i):
+    r = Q1('SELECT r.*,ru.name reporter,tu.name tuser,tu.banned tbanned FROM reports r LEFT JOIN users ru ON ru.id=r.reporter LEFT JOIN users tu ON tu.id=r.tuser WHERE r.id=?', i)
+    if not r: raise E('Not found', 404)
+    r['snap'] = json.loads(r['snap'] or '{}')
+    r['same'] = Q('SELECT x.id,x.reason,x.details,x.status,x.ts,u.name reporter FROM reports x LEFT JOIN users u ON u.id=x.reporter WHERE x.kind=? AND x.target=? ORDER BY x.ts DESC', r['kind'], r['target'])
+    if r['tuser']: r['ips'] = Q('SELECT ip,last FROM user_ips WHERE uid=? ORDER BY last DESC LIMIT 10', r['tuser']); r['user_reports'] = Q1('SELECT COUNT(*) n FROM reports WHERE tuser=?', r['tuser'])['n']; r['banned_ips'] = [x['ip'] for x in r['ips'] if x['ip'] in BANNED_IPS]
+    if r['server']: r['server_name'] = (Q1('SELECT name FROM servers WHERE id=?', r['server']) or {}).get('name')
+    if r['conv']: c = Q1('SELECT kind FROM convs WHERE id=?', r['conv']); r['conv_kind'] = c and c['kind']
+    return r
+@route('/admin/reports/<int:i>', 'POST', admin=True)
+def adm_report_set(i):
+    b = B(); st = b.get('status'); r = Q1('SELECT * FROM reports WHERE id=?', i)
+    if not r or st not in ('open', 'resolved', 'dismissed'): raise E('Bad request')
+    ids = [x['id'] for x in Q("SELECT id FROM reports WHERE kind=? AND target=? AND status='open'", r['kind'], r['target'])] + [i] if b.get('all') else [i]
+    X(f'UPDATE reports SET status=?,note=?,handler=?,hts=? WHERE id IN ({IN(set(ids))})', st, cl(b.get('note'), 500), g.u, now())
+    for x in Q(f'SELECT DISTINCT reporter FROM reports WHERE id IN ({IN(set(ids))})'):
+        if st != 'open': notify(x['reporter'], 'Thanks for your report. A site admin reviewed it.', '', 'system')
+    return {}
+def report_conv(cid):
+    if not Q1('SELECT 1 FROM reports WHERE conv=?', cid): raise E('Only conversations tied to a report can be opened', 403)
+    return conv_get(cid)
+@route('/admin/conv/<int:cid>', admin=True)
+def adm_conv(cid):
+    c = report_conv(cid); L = Q('SELECT m.id,m.body,m.ts,u.name author,u.display,u.avatar,u.color FROM msgs m JOIN users u ON u.id=m.uid WHERE m.conv=? ORDER BY m.id DESC LIMIT 300', cid)[::-1]
+    return dict(kind=c['kind'], name=c['name'], server=c['server'], members=[x['name'] for x in Q('SELECT u.name FROM cmembers m JOIN users u ON u.id=m.uid WHERE m.conv=?', cid)], messages=L)
+@route('/admin/conv/<int:cid>/join', 'POST', admin=True)
+def adm_conv_join(cid):
+    c = report_conv(cid)
+    if c['kind'] == 'group': X('INSERT OR IGNORE INTO cmembers VALUES(?,?)', cid, g.u); return dict(id=cid)
+    if c['server']: X('INSERT OR IGNORE INTO smembers VALUES(?,?)', c['server'], g.u); return dict(server=c['server'], id=cid)
+    raise E('Direct messages can be read from the report but not joined')
+@route('/admin/servers/<int:sid>/join', 'POST', admin=True)
+def adm_server_join(sid):
+    if not Q1('SELECT 1 FROM reports WHERE server=?', sid): raise E('A server can be joined from a report about it', 403)
+    X('INSERT OR IGNORE INTO smembers VALUES(?,?)', sid, g.u); return dict(id=sid)
+@route('/admin/ip_bans', admin=True)
+def adm_ip_bans(): return Q('SELECT b.*,u.name by_name FROM ip_bans b LEFT JOIN users u ON u.id=b.by ORDER BY b.ts DESC')
+@route('/admin/ip_ban', 'POST', admin=True)
+def adm_ip_ban():
+    import ipaddress; b = B(); ips = set()
+    for x in (b.get('ips') or []) + ([b['ip']] if b.get('ip') else []):
+        try: ips.add(str(ipaddress.ip_address(str(x).strip())))
+        except ValueError: raise E('That is not a valid IP address: ' + str(x))
+    if b.get('uid'): ips |= {r['ip'] for r in Q('SELECT ip FROM user_ips WHERE uid=? ORDER BY last DESC LIMIT 10', int(b['uid']))}
+    if not ips: raise E('No IP address to ban')
+    skipped = sorted(ips & {request.remote_addr}); ips -= {request.remote_addr}
+    if not ips: raise E('That is your own IP address, so I refused to ban it.')
+    for ip in ips: X('INSERT OR REPLACE INTO ip_bans VALUES(?,?,?,?)', ip, cl(b.get('reason'), 100), g.u, now())
+    BANNED_IPS.update(ips); return dict(banned=sorted(ips), skipped=skipped)
+@route('/admin/ip_unban', 'POST', admin=True)
+def adm_ip_unban(): ip = cl(B().get('ip'), 60); X('DELETE FROM ip_bans WHERE ip=?', ip); BANNED_IPS.discard(ip); return {}
+@route('/admin/users/<int:uid>/ips', admin=True)
+def adm_user_ips(uid): return [dict(r, banned=r['ip'] in BANNED_IPS) for r in Q('SELECT ip,first,last FROM user_ips WHERE uid=? ORDER BY last DESC LIMIT 20', uid)]
 
 # ---------------- static, compression, startup ----------------
 STATIC = {}
@@ -1164,6 +1347,9 @@ def init():
         d.executescript(SCHEMA)
         for t, col in MIGRATE:
             if col.split()[0] not in [r['name'] for r in Q(f'PRAGMA table_info({t})')]: d.execute(f'ALTER TABLE {t} ADD COLUMN {col}')
+        for r in Q('SELECT * FROM pfiles'):
+            d.execute('INSERT INTO downloads(pid,label,fn,name,size,ts) VALUES(?,?,?,?,?,?)', (r['pid'], {'mac': 'macOS', 'ios': 'iOS'}.get(r['platform'], r['platform'].capitalize()), r['fn'], r['name'], r['size'], time.time()))
+        d.execute('DELETE FROM pfiles'); BANNED_IPS.update(r['ip'] for r in Q('SELECT ip FROM ip_bans'))
         if legacy:   # remove the old demo content
             for n in ('aria', 'kai', 'rin', 'nova', 'ghost', 'chef'):
                 u = Q1('SELECT id FROM users WHERE name=?', n); u and purge_user(u['id'])
